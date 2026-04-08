@@ -14,6 +14,7 @@ ESP32 que muestra:
 - **Gráfica temporal** de los últimos 200 puntos
 - **Gauge visual** con gradiente de colores
 - **Ángulo acumulado** por integración numérica
+- **Parámetros del MAS** (período T, frecuencia f, ωₙ)
 - **Temperatura** del sensor
 
 ## Hardware Requerido
@@ -71,16 +72,20 @@ idf.py -p COM3 flash monitor
 ## Uso
 
 1. **Flashear** el firmware al ESP32
-2. **Conectar** al WiFi:
+2. **Conectar** al WiFi creado por el ESP32:
    - **SSID:** `PenduloTorsion`
    - **Contraseña:** `fisica2026`
 3. **Abrir** en el navegador: `http://192.168.4.1`
 4. La interfaz mostrará los datos del giroscopio en tiempo real
 
+> 💡 El ESP32 crea su **propia red WiFi** (modo SoftAP), no necesitas
+> un router ni conexión a internet. Cualquier dispositivo (celular,
+> laptop, tablet) puede conectarse directamente.
+
 ## Estructura del Proyecto
 
 ```
-PRACTICA DE FISICA/
+ESP32-MPU6050/
 ├── CMakeLists.txt          # Configuración CMake del proyecto
 ├── sdkconfig.defaults      # Configuración por defecto del SDK
 ├── README.md               # Este archivo
@@ -89,8 +94,10 @@ PRACTICA DE FISICA/
     ├── main.c              # Punto de entrada (app_main)
     ├── mpu6050.h           # Header del driver MPU-6050
     ├── mpu6050.c           # Driver I2C (nueva API v6.0)
-    ├── wifi_softap.h       # Header WiFi SoftAP
+    ├── wifi_softap.h       # Header WiFi SoftAP (modo usado)
     ├── wifi_softap.c       # Configuración WiFi AP
+    ├── wifi_sta.h          # Header WiFi Station (alternativo)
+    ├── wifi_sta.c          # WiFi STA — conectar a red existente
     ├── web_server.h        # Header del servidor web
     └── web_server.c        # Servidor HTTP + UI embebida
 ```
@@ -121,12 +128,14 @@ Velocidad Angular: gyro_z = raw / 131.0 [°/s]  (para ±250 °/s)
 | Endpoint | Método | Respuesta |
 |---|---|---|
 | `/` | GET | Página HTML con interfaz completa |
-| `/data` | GET | JSON: `{"gyro_z", "raw_z", "angle_z", "timestamp", "temp_c"}` |
-| `/reset` | POST | Reinicia el ángulo acumulado a 0° |
+| `/data` | GET | JSON: `{"gyro_z", "raw_z", "angle_z", "timestamp", "temp_c", "bias", "mas_valid", ...}` |
+| `/reset` | POST | Reinicia el ángulo acumulado, MAS y gráficas |
+| `/calibrate` | POST | Recalibra el bias del giroscopio (~5s, sensor en reposo) |
 
 ## Notas Técnicas
 
 - **I2C Driver:** Usa la nueva API `driver/i2c_master.h` de ESP-IDF v6.0 (el driver legacy está deprecado)
+- **WiFi Mode:** SoftAP — el ESP32 crea su red, IP fija `192.168.4.1`
 - **Filtro DLPF:** Configurado a 42 Hz para reducir ruido en mediciones del péndulo
 - **Integración:** El ángulo se obtiene por integración numérica simple (trapezoidal)
 - **Refresh Rate:** La interfaz web actualiza datos 5 veces por segundo (200ms)

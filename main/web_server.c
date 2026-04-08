@@ -12,7 +12,7 @@
 
 #include "web_server.h"
 #include "mpu6050.h"
-#include "wifi_sta.h"
+#include "wifi_softap.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -322,7 +322,7 @@ static const char MAIN_PAGE_HTML[] =
 
 /* ── Info bar ── */
 "<div class='info-bar'>"
-    "<div><span class='status-dot'></span>Conectado a red WiFi</div>"
+    "<div><span class='status-dot'></span>Red: PenduloTorsion • 192.168.4.1</div>"
     "<div id='fps'>— muestras/s</div>"
 "</div>"
 

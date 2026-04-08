@@ -20,7 +20,7 @@
 #include "freertos/task.h"
 
 #include "mpu6050.h"
-#include "wifi_sta.h"
+#include "wifi_softap.h"
 #include "web_server.h"
 
 static const char *TAG = "MAIN";
@@ -82,11 +82,13 @@ void app_main(void)
     }
 
     /* ═══════════════════════════════════════════════════
-     *  2. Conectar a WiFi (modo Station)
+     *  2. Inicializar WiFi SoftAP (crear red propia)
+     *     No requiere router ni internet externo.
+     *     IP fija: 192.168.4.1
      * ═══════════════════════════════════════════════════ */
-    esp_err_t wifi_ret = wifi_sta_init();
+    esp_err_t wifi_ret = wifi_softap_init();
     if (wifi_ret != ESP_OK) {
-        ESP_LOGE(TAG, "No se pudo conectar al WiFi. Reiniciando en 5s...");
+        ESP_LOGE(TAG, "No se pudo iniciar el WiFi AP. Reiniciando en 5s...");
         vTaskDelay(pdMS_TO_TICKS(5000));
         esp_restart();
     }
@@ -99,18 +101,17 @@ void app_main(void)
     /* ═══════════════════════════════════════════════════
      *  Sistema listo
      * ═══════════════════════════════════════════════════ */
-    const char *ip = wifi_sta_get_ip();
-
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "╔═══════════════════════════════════════════════════╗");
     ESP_LOGI(TAG, "║                                                   ║");
     ESP_LOGI(TAG, "║   ✓ Sistema listo                                ║");
     ESP_LOGI(TAG, "║                                                   ║");
-    ESP_LOGI(TAG, "║   Red WiFi: %s", WIFI_STA_SSID);
-    ESP_LOGI(TAG, "║   IP asignada: %s", ip);
+    ESP_LOGI(TAG, "║   Red WiFi: %s", WIFI_AP_SSID);
+    ESP_LOGI(TAG, "║   Contraseña: %s", WIFI_AP_PASS);
+    ESP_LOGI(TAG, "║   IP: 192.168.4.1                                ║");
     ESP_LOGI(TAG, "║                                                   ║");
-    ESP_LOGI(TAG, "║   Abrir en navegador:");
-    ESP_LOGI(TAG, "║   http://%s", ip);
+    ESP_LOGI(TAG, "║   Abrir en navegador:                            ║");
+    ESP_LOGI(TAG, "║   http://192.168.4.1                             ║");
     ESP_LOGI(TAG, "║                                                   ║");
     ESP_LOGI(TAG, "║   Datos mostrados:                               ║");
     ESP_LOGI(TAG, "║   • ω(t) velocidad angular [°/s]                ║");
@@ -119,7 +120,7 @@ void app_main(void)
     ESP_LOGI(TAG, "║                                                   ║");
     ESP_LOGI(TAG, "╚═══════════════════════════════════════════════════╝");
     ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, ">> Abre http://%s en cualquier dispositivo de la misma red", ip);
+    ESP_LOGI(TAG, ">> Conéctate a la red '%s' y abre http://192.168.4.1", WIFI_AP_SSID);
 
     /* Loop de monitoreo */
     while (1) {
