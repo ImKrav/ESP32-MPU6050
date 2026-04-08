@@ -1,0 +1,34 @@
+# ============================================
+# Péndulo de Torsión — Configuración por Defecto
+# ESP-IDF v6.0
+# ============================================
+
+# --- Target ---
+CONFIG_IDF_TARGET="esp32"
+
+# --- Flash ---
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# --- WiFi ---
+CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y
+CONFIG_ESP_WIFI_STA_DISCONNECTED_PM_ENABLE=n
+
+# --- LWIP ---
+CONFIG_LWIP_MAX_SOCKETS=8
+
+# --- HTTP Server ---
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
+CONFIG_HTTPD_MAX_URI_LEN=512
+
+# --- FreeRTOS ---
+CONFIG_FREERTOS_HZ=1000
+
+# --- Log Level ---
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LOG_DEFAULT_LEVEL=3
+
+# --- Stack Size ---
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# --- Partition Table ---
+CONFIG_PARTITION_TABLE_SINGLE_APP=y
