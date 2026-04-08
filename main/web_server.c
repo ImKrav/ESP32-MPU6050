@@ -1,13 +1,19 @@
 /**
  * @file web_server.c
- * @brief Servidor HTTP con interfaz web embebida para el péndulo de torsión
+ * @brief Servidor HTTP + WebSocket con interfaz web embebida para el péndulo de torsión
  *
  * Incluye una interfaz web premium con:
+ * - WebSocket para datos en tiempo real a ~50 Hz (push desde ESP32)
  * - Gráfica en tiempo real de ω(t) (velocidad angular) y θ(t) (ángulo)
  * - Indicador gauge de velocidad angular
  * - Panel de parámetros del MAS (período, frecuencia, ωₙ)
  * - Visualización del ángulo acumulado por integración
  * - Diseño oscuro con gradientes y animaciones
+ *
+ * Arquitectura de datos:
+ * - Una tarea FreeRTOS ("ws_push_task") lee el MPU6050 a 50 Hz
+ *   y empuja cada muestra por WebSocket a todos los clientes conectados.
+ * - Los endpoints REST (POST /reset, POST /calibrate) se mantienen.
  */
 
 #include "web_server.h"
@@ -20,12 +26,22 @@
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 static const char *TAG = "WEB_SRV";
 static httpd_handle_t s_server = NULL;
 
+/* ── WebSocket ── */
+#define WS_MAX_CLIENTS    4       /**< Máximo de clientes WebSocket simultáneos */
+#define WS_PUSH_RATE_MS   20      /**< Intervalo de envío: 20 ms → 50 Hz */
+
+static int s_ws_fds[WS_MAX_CLIENTS];          /**< File descriptors de clientes WS */
+static int s_ws_count = 0;                     /**< Número de clientes WS activos */
+static TaskHandle_t s_ws_task_handle = NULL;    /**< Handle de la tarea push */
+
 /* ══════════════════════════════════════════════════════════════
- *  HTML/CSS/JS Embebido — Interfaz Web Premium
+ *  HTML/CSS/JS Embebido — Interfaz Web Premium con WebSocket
  * ══════════════════════════════════════════════════════════════ */
 
 static const char MAIN_PAGE_HTML[] =
@@ -163,9 +179,12 @@ static const char MAIN_PAGE_HTML[] =
 "}"
 ".status-dot{"
     "display:inline-block;width:8px;height:8px;border-radius:50%;"
-    "background:#4ade80;margin-right:6px;"
+    "margin-right:6px;"
     "animation:pulse 2s infinite;"
 "}"
+".status-dot.connected{background:#4ade80}"
+".status-dot.disconnected{background:#f87171;animation:none}"
+".status-dot.connecting{background:#fbbf24}"
 "@keyframes pulse{"
     "0%,100%{opacity:1}"
     "50%{opacity:0.4}"
@@ -291,6 +310,44 @@ static const char MAIN_PAGE_HTML[] =
     "box-shadow:0 4px 20px rgba(251,191,36,0.15);"
 "}"
 
+/* Export button (green) */
+".btn-export{"
+    "background:linear-gradient(135deg,rgba(74,222,128,0.15),rgba(74,222,128,0.08));"
+    "border-color:rgba(74,222,128,0.3);color:#4ade80;"
+"}"
+".btn-export:hover{"
+    "background:linear-gradient(135deg,rgba(74,222,128,0.25),rgba(74,222,128,0.15));"
+    "border-color:rgba(74,222,128,0.5);color:#86efac;"
+    "box-shadow:0 4px 20px rgba(74,222,128,0.15);"
+"}"
+
+/* Record toggle button (red/recording state) */
+".btn-rec{"
+    "background:linear-gradient(135deg,rgba(248,113,113,0.15),rgba(248,113,113,0.08));"
+    "border-color:rgba(248,113,113,0.3);color:#f87171;"
+"}"
+".btn-rec:hover{"
+    "background:linear-gradient(135deg,rgba(248,113,113,0.25),rgba(248,113,113,0.15));"
+    "border-color:rgba(248,113,113,0.5);color:#fca5a5;"
+    "box-shadow:0 4px 20px rgba(248,113,113,0.15);"
+"}"
+".btn-rec.recording{"
+    "background:linear-gradient(135deg,rgba(248,113,113,0.3),rgba(248,113,113,0.18));"
+    "border-color:rgba(248,113,113,0.5);color:#fca5a5;"
+    "box-shadow:0 0 12px rgba(248,113,113,0.2);"
+"}"
+".btn-rec.recording .rec-dot{"
+    "display:inline-block;width:8px;height:8px;border-radius:50%;"
+    "background:#f87171;margin-right:4px;animation:pulse 1s infinite;"
+"}"
+".rec-counter{"
+    "display:inline-flex;align-items:center;gap:5px;"
+    "padding:3px 10px;border-radius:12px;font-size:0.72em;"
+    "border:1px solid rgba(74,222,128,0.2);"
+    "background:rgba(74,222,128,0.06);color:#4ade80;"
+"}"
+".rec-counter .counter-num{font-weight:700;font-variant-numeric:tabular-nums}"
+
 /* Status toast */
 ".toast{"
     "position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(80px);"
@@ -310,6 +367,14 @@ static const char MAIN_PAGE_HTML[] =
     "border-right-color:transparent;border-radius:50%;animation:spin 0.6s linear infinite}"
 "@keyframes spin{to{transform:rotate(360deg)}}"
 
+/* ── WS status badge ── */
+".ws-badge{"
+    "display:inline-flex;align-items:center;gap:5px;"
+    "padding:3px 10px;border-radius:12px;font-size:0.72em;"
+    "border:1px solid rgba(100,100,200,0.15);"
+    "background:rgba(15,15,40,0.6);"
+"}"
+
 "</style>"
 "</head>"
 "<body>"
@@ -317,13 +382,14 @@ static const char MAIN_PAGE_HTML[] =
 /* ── Header ── */
 "<div class='header'>"
     "<h1>⟳ Péndulo de Torsión</h1>"
-    "<div class='subtitle'>Giroscopio MPU-6050 • Eje Z • ESP32 WROOM 32D</div>"
+    "<div class='subtitle'>Giroscopio MPU-6050 • Eje Z • ESP32 WROOM 32D • <strong>WebSocket 50 Hz</strong></div>"
 "</div>"
 
 /* ── Info bar ── */
 "<div class='info-bar'>"
-    "<div><span class='status-dot'></span>Red: PenduloTorsion • 192.168.4.1</div>"
-    "<div id='fps'>— muestras/s</div>"
+    "<div><span class='status-dot connecting' id='wsDot'></span>"
+        "<span id='wsStatus'>Conectando...</span></div>"
+    "<div class='ws-badge'>⚡ <span id='fps'>— muestras/s</span></div>"
 "</div>"
 
 /* ── Panel de control ── */
@@ -334,6 +400,13 @@ static const char MAIN_PAGE_HTML[] =
     "<button class='btn-ctrl btn-calib' id='btnCalib' onclick='doCalibrate()'>"
         "⚖ Calibrar Bias (~5s)"
     "</button>"
+    "<button class='btn-ctrl btn-rec recording' id='btnRec' onclick='toggleRecording()'>"
+        "<span class='rec-dot'></span> ● Grabando"
+    "</button>"
+    "<button class='btn-ctrl btn-export' id='btnExport' onclick='doExport()'>"
+        "📥 Exportar CSV"
+    "</button>"
+    "<span class='rec-counter' id='recCounter'>📊 <span class='counter-num' id='sampleCount'>0</span> muestras</span>"
 "</div>"
 
 /* ── Toast notification ── */
@@ -448,6 +521,10 @@ static const char MAIN_PAGE_HTML[] =
             "<span class='data-value'>ESP32 WROOM 32D</span>"
         "</div>"
         "<div class='data-row'>"
+            "<span class='data-label'>Transporte</span>"
+            "<span class='data-value'>WebSocket (push)</span>"
+        "</div>"
+        "<div class='data-row'>"
             "<span class='data-label'>I2C</span>"
             "<span class='data-value'>400 kHz (GPIO21/22)</span>"
         "</div>"
@@ -460,8 +537,8 @@ static const char MAIN_PAGE_HTML[] =
             "<span class='data-value'>42 Hz</span>"
         "</div>"
         "<div class='data-row'>"
-            "<span class='data-label'>Sample Rate</span>"
-            "<span class='data-value'>100 Hz</span>"
+            "<span class='data-label'>Push Rate</span>"
+            "<span class='data-value' id='pushRate'>50 Hz</span>"
         "</div>"
         "<div class='data-row'>"
             "<span class='data-label'>Temperatura</span>"
@@ -471,201 +548,154 @@ static const char MAIN_PAGE_HTML[] =
 
 "</div>"
 
-/* ═══════════════════ JavaScript ═══════════════════ */
+/* ═══════════════════ JavaScript (WebSocket) ═══════════════════ */
 "<script>"
 
 /* ── Estado ── */
-"const MAX_PTS=200;"
+"const MAX_PTS=300;"
 "let omegaPts=[];"
 "let thetaPts=[];"
 "let chartMode=0;"  /* 0=omega, 1=theta, 2=both */
 "let fpsCount=0;"
 "let lastFpsTime=Date.now();"
 
-/* ── Canvas setup ── */
+/* ── Data Export Buffer ── */
+"let exportBuf=[];"   /* Array de objetos: {ts, gz, rz, az, bi, tc, pe, fr, on, am, oc, mv} */
+"let isRecording=true;"  /* Empieza grabando por defecto */
+
+/* ── Canvas setup (optimizado para rendimiento) ── */
 "const canvas=document.getElementById('chart');"
-"const ctx=canvas.getContext('2d');"
-"let cW,cH;"
+"const ctx=canvas.getContext('2d',{alpha:false});"  /* opaque = faster compositing */
+"let cW,cH,dpr=1;"
 
 "function resizeCanvas(){"
     "const r=canvas.parentElement.getBoundingClientRect();"
-    "canvas.width=r.width*2;canvas.height=r.height*2;"
+    "dpr=Math.min(window.devicePixelRatio||1,1.5);"  /* cap DPR to avoid perf hit */
+    "canvas.width=Math.round(r.width*dpr);"
+    "canvas.height=Math.round(r.height*dpr);"
     "cW=r.width;cH=r.height;"
+    "ctx.setTransform(dpr,0,0,dpr,0,0);"
 "}"
 "resizeCanvas();"
 "window.addEventListener('resize',()=>{resizeCanvas();drawChart()});"
 
+/* ── Cache DOM refs (evitar getElementById en cada frame) ── */
+"const $tabOmega=document.getElementById('tabOmega');"
+"const $tabTheta=document.getElementById('tabTheta');"
+"const $tabBoth=document.getElementById('tabBoth');"
+"const $gaugeArc=document.getElementById('gaugeArc');"
+"const $gaugeText=document.getElementById('gaugeText');"
+
 /* ── Cambiar gráfica ── */
 "function switchChart(mode){"
     "chartMode=mode;"
-    "document.getElementById('tabOmega').className='chart-tab'+(mode===0?' active':'');"
-    "document.getElementById('tabTheta').className='chart-tab'+(mode===1?' active':'');"
-    "document.getElementById('tabBoth').className='chart-tab'+(mode===2?' active':'');"
+    "$tabOmega.className='chart-tab'+(mode===0?' active':'');"
+    "$tabTheta.className='chart-tab'+(mode===1?' active':'');"
+    "$tabBoth.className='chart-tab'+(mode===2?' active':'');"
     "drawChart();"
 "}"
 
-/* ── Dibujar una serie en el canvas ── */
-"function drawSeries(pts,color,glowColor,label,yOffset,yScale){"
-    "if(pts.length<2)return;"
-    "const W=cW,H=cH*yScale;"
-    "const baseY=yOffset;"
+/* ── Dibujar una serie (SIN shadowBlur — rendimiento 10x mejor) ── */
+"function drawSeries(pts,color,fillColor,label,baseY,H){"
+    "const n=pts.length;"
+    "if(n<2)return;"
 
-    "let minV=Infinity,maxV=-Infinity;"
-    "for(const p of pts){if(p<minV)minV=p;if(p>maxV)maxV=p}"
-    "const range=Math.max(Math.abs(minV),Math.abs(maxV),0.5)*1.3;"
+    /* Auto-rango */
+    "let mx=0.5;"
+    "for(let i=0;i<n;i++){const a=pts[i]<0?-pts[i]:pts[i];if(a>mx)mx=a;}"
+    "mx*=1.3;"
 
-    "const plotW=W-55;"
-    "const step=plotW/MAX_PTS;"
+    "const padL=45,midY=baseY+H*0.5,hH=H*0.5;"
+    "const step=(cW-padL)/MAX_PTS;"
 
-    /* Cero line */
-    "ctx.save();"
-    "ctx.strokeStyle='rgba(100,140,255,0.15)';"
+    /* Zero-line (solid, no dashed = más rápido) */
+    "ctx.strokeStyle='rgba(100,140,255,0.12)';"
     "ctx.lineWidth=0.5;"
-    "ctx.setLineDash([3,3]);"
     "ctx.beginPath();"
-    "ctx.moveTo(45,baseY+H/2);"
-    "ctx.lineTo(W,baseY+H/2);"
+    "ctx.moveTo(padL,midY);"
+    "ctx.lineTo(cW,midY);"
     "ctx.stroke();"
-    "ctx.setLineDash([]);"
 
-    /* Y labels */
+    /* Y labels + serie label */
     "ctx.font='9px system-ui';"
     "ctx.fillStyle='#444466';"
-    "ctx.fillText('+'+range.toFixed(1),2,baseY+12);"
-    "ctx.fillText('0',2,baseY+H/2+3);"
-    "ctx.fillText('-'+range.toFixed(1),2,baseY+H-2);"
-
-    /* Label */
+    "ctx.fillText('+'+mx.toFixed(0),2,baseY+12);"
+    "ctx.fillText('0',2,midY+3);"
+    "ctx.fillText('-'+mx.toFixed(0),2,baseY+H-2);"
     "ctx.fillStyle=color;ctx.font='bold 10px system-ui';"
-    "ctx.fillText(label,48,baseY+12);"
+    "ctx.fillText(label,padL+3,baseY+12);"
 
-    /* Glow */
-    "ctx.shadowColor=glowColor;"
-    "ctx.shadowBlur=6;"
+    /* Pre-calcular coordenadas Y (un solo pass) */
+    "const invR=hH/mx;"
 
-    "ctx.strokeStyle=color;"
-    "ctx.lineWidth=1.8;"
-    "ctx.lineJoin='round';ctx.lineCap='round';"
+    /* Construir path de la línea */
     "ctx.beginPath();"
-    "for(let i=0;i<pts.length;i++){"
-        "const x=45+i*step;"
-        "const y=baseY+H/2-(pts[i]/range)*(H/2);"
-        "if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);"
+    "ctx.moveTo(padL,midY-pts[0]*invR);"
+    "for(let i=1;i<n;i++){"
+        "ctx.lineTo(padL+i*step,midY-pts[i]*invR);"
     "}"
+
+    /* Glow: trazo ancho semitransparente (NO usa shadowBlur) */
+    "ctx.lineWidth=4;ctx.strokeStyle=fillColor;ctx.lineJoin='round';ctx.lineCap='round';"
     "ctx.stroke();"
-    "ctx.shadowBlur=0;"
 
-    /* Area fill */
-    "const aGrad=ctx.createLinearGradient(0,baseY,0,baseY+H);"
-    "aGrad.addColorStop(0,color.replace('0.9','0.1').replace(')',',0.1)'));"
-    "aGrad.addColorStop(1,'rgba(0,0,0,0)');"
-    "ctx.fillStyle=aGrad;"
-    "ctx.lineTo(45+(pts.length-1)*step,baseY+H);"
-    "ctx.lineTo(45,baseY+H);"
-    "ctx.closePath();ctx.fill();"
+    /* Línea principal nítida */
+    "ctx.lineWidth=1.5;ctx.strokeStyle=color;"
+    "ctx.stroke();"
 
-    /* Current point */
-    "if(pts.length>0){"
-        "const lx=45+(pts.length-1)*step;"
-        "const ly=baseY+H/2-(pts[pts.length-1]/range)*(H/2);"
-        "ctx.shadowColor=glowColor;ctx.shadowBlur=10;"
-        "ctx.fillStyle=color;"
-        "ctx.beginPath();ctx.arc(lx,ly,3,0,Math.PI*2);ctx.fill();"
-        "ctx.shadowBlur=0;"
-    "}"
-    "ctx.restore();"
+    /* Area fill: cerrar path hacia abajo */
+    "const lastX=padL+(n-1)*step;"
+    "ctx.lineTo(lastX,baseY+H);"
+    "ctx.lineTo(padL,baseY+H);"
+    "ctx.closePath();"
+    "ctx.fillStyle=fillColor;"
+    "ctx.fill();"
+
+    /* Punto actual (sin shadow) */
+    "const ly=midY-pts[n-1]*invR;"
+    "ctx.fillStyle=color;"
+    "ctx.beginPath();ctx.arc(lastX,ly,3,0,6.283);ctx.fill();"
+    /* Punto outer glow (circle behind) */
+    "ctx.fillStyle=fillColor;"
+    "ctx.beginPath();ctx.arc(lastX,ly,6,0,6.283);ctx.fill();"
+    /* Redraw inner dot on top */
+    "ctx.fillStyle=color;"
+    "ctx.beginPath();ctx.arc(lastX,ly,2.5,0,6.283);ctx.fill();"
 "}"
 
 /* ── Dibujar gráfica completa ── */
 "function drawChart(){"
-    "ctx.save();"
-    "ctx.setTransform(2,0,0,2,0,0);" /* Retina */
-    "ctx.clearRect(0,0,cW,cH);"
+    /* Clear con fondo sólido (más rápido que clearRect en canvas opaco) */
+    "ctx.fillStyle='#11112a';"
+    "ctx.fillRect(0,0,cW,cH);"
 
     "if(chartMode===0){"
-        "drawSeries(omegaPts,'rgba(96,165,250,0.9)','rgba(96,165,250,0.5)','ω(t) °/s',0,1);"
+        "drawSeries(omegaPts,'rgba(96,165,250,0.9)','rgba(96,165,250,0.12)','ω °/s',0,cH);"
     "}else if(chartMode===1){"
-        "drawSeries(thetaPts,'rgba(167,139,250,0.9)','rgba(167,139,250,0.5)','θ(t) °',0,1);"
+        "drawSeries(thetaPts,'rgba(167,139,250,0.9)','rgba(167,139,250,0.12)','θ °',0,cH);"
     "}else{"
-        "drawSeries(omegaPts,'rgba(96,165,250,0.9)','rgba(96,165,250,0.4)','ω(t) °/s',0,0.5);"
-        "drawSeries(thetaPts,'rgba(167,139,250,0.9)','rgba(167,139,250,0.4)','θ(t) °',cH*0.5,0.5);"
+        "const hH=cH*0.5;"
+        "drawSeries(omegaPts,'rgba(96,165,250,0.9)','rgba(96,165,250,0.10)','ω °/s',0,hH);"
+        "drawSeries(thetaPts,'rgba(167,139,250,0.9)','rgba(167,139,250,0.10)','θ °',hH,hH);"
     "}"
-    "ctx.restore();"
 "}"
 
-/* ── Actualizar gauge ── */
+/* ── Actualizar gauge (refs cacheadas) ── */
 "function updateGauge(v){"
     "const mx=250;"
     "const c=Math.max(-mx,Math.min(mx,v));"
     "const pct=(c+mx)/(2*mx);"
-    "const arc=251;"
-    "document.getElementById('gaugeArc').setAttribute('stroke-dasharray',(pct*arc)+' '+arc);"
-    "document.getElementById('gaugeText').textContent=v.toFixed(1);"
+    "$gaugeArc.setAttribute('stroke-dasharray',(pct*251)+' 251');"
+    "$gaugeText.textContent=v.toFixed(1);"
 "}"
 
-/* ── Fetch de datos ── */
-"async function fetchData(){"
-    "try{"
-        "const r=await fetch('/data');"
-        "const d=await r.json();"
-        "if(d.error)return;"
-
-        "const gz=d.gyro_z;"
-        "const angle=d.angle_z;"
-
-        /* ω(t) */
-        "const el=document.getElementById('gyroZ');"
-        "el.innerHTML=gz.toFixed(2)+'<span class=\"unit\">°/s</span>';"
-        "el.className='big-value '+(gz>0.5?'positive':(gz<-0.5?'negative':'zero'));"
-        "document.getElementById('rawZ').textContent=d.raw_z;"
-        "document.getElementById('timestamp').textContent=d.timestamp+' ms';"
-
-        /* Bias */
-        "if(d.bias!==undefined){"
-            "document.getElementById('biasZ').textContent=d.bias.toFixed(4)+' °/s';"
-        "}"
-
-        /* θ(t) */
-        "document.getElementById('angleZ').innerHTML=angle.toFixed(2)+'<span class=\"unit\">°</span>';"
-
-        /* Temperatura */
-        "if(d.temp_c!==undefined){"
-            "document.getElementById('tempC').textContent=d.temp_c.toFixed(1)+' °C';"
-        "}"
-
-        /* MAS parameters */
-        "if(d.mas_valid){"
-            "document.getElementById('masT').innerHTML=d.period.toFixed(3)+'<span class=\"mas-unit\">s</span>';"
-            "document.getElementById('masF').innerHTML=d.freq.toFixed(3)+'<span class=\"mas-unit\">Hz</span>';"
-            "document.getElementById('masOmegaN').innerHTML=d.omega_n.toFixed(3)+'<span class=\"mas-unit\">rad/s</span>';"
-            "document.getElementById('masAmp').innerHTML=d.amplitude.toFixed(2)+'<span class=\"mas-unit\">°/s</span>';"
-            "const b=document.getElementById('oscBadge');"
-            "b.className='osc-badge';"
-            "b.innerHTML='✓ '+d.oscillations+' oscilaciones detectadas';"
-        "}else{"
-            "const b=document.getElementById('oscBadge');"
-            "b.className='osc-badge waiting';"
-            "b.innerHTML='⏳ Esperando oscilaciones... (mueve el péndulo)';"
-        "}"
-
-        /* Gráficas */
-        "omegaPts.push(gz);"
-        "thetaPts.push(angle);"
-        "if(omegaPts.length>MAX_PTS)omegaPts.shift();"
-        "if(thetaPts.length>MAX_PTS)thetaPts.shift();"
-        "drawChart();"
-
-        /* Gauge */
-        "updateGauge(gz);"
-
-        /* FPS counter */
-        "fpsCount++;"
-        "const now=Date.now();"
-        "if(now-lastFpsTime>=1000){"
-            "document.getElementById('fps').textContent=fpsCount+' muestras/s';"
-            "fpsCount=0;lastFpsTime=now;"
-        "}"
-    "}catch(e){console.error('Fetch error:',e)}"
+/* ── Render loop: requestAnimationFrame continuo ── */
+"let drawPending=false;"
+"function schedDraw(){"
+    "if(!drawPending){"
+        "drawPending=true;"
+        "requestAnimationFrame(()=>{drawChart();drawPending=false;});"
+    "}"
 "}"
 
 /* ── Toast notification ── */
@@ -677,8 +707,149 @@ static const char MAIN_PAGE_HTML[] =
     "t._tid=setTimeout(()=>{t.className='toast'},duration||3000);"
 "}"
 
-/* ── Reinicio completo ── */
-"let polling=true;"
+/* ══════════════════════════════════════════════════════════════
+ *  WebSocket — Conexión push en tiempo real
+ * ══════════════════════════════════════════════════════════════ */
+
+"let ws=null;"
+"let wsReconnectTimer=null;"
+"let wsReconnectDelay=500;"  /* Empieza con 500ms, crece hasta 5s */
+
+"function wsConnect(){"
+    "if(ws&&(ws.readyState===0||ws.readyState===1))return;"  /* ya conectado o conectando */
+
+    "const host=location.host||'192.168.4.1';"
+    "const url='ws://'+host+'/ws';"
+    "console.log('WS conectando a',url);"
+
+    "setWsUI('connecting','Conectando...');"
+    "ws=new WebSocket(url);"
+
+    "ws.onopen=function(){"
+        "console.log('WS conectado');"
+        "wsReconnectDelay=500;"  /* reset delay on success */
+        "setWsUI('connected','WebSocket activo • 192.168.4.1');"
+        "showToast('⚡ WebSocket conectado — datos en tiempo real','success',2000);"
+    "};"
+
+    "ws.onmessage=function(ev){"
+        "try{"
+            "const d=JSON.parse(ev.data);"
+            "if(d.error)return;"
+            "handleData(d);"
+        "}catch(e){console.error('WS parse:',e)}"
+    "};"
+
+    "ws.onclose=function(){"
+        "console.log('WS cerrado, reconectando en',wsReconnectDelay,'ms');"
+        "setWsUI('disconnected','Desconectado — reconectando...');"
+        "schedReconnect();"
+    "};"
+
+    "ws.onerror=function(e){"
+        "console.error('WS error:',e);"
+        "ws.close();"
+    "};"
+"}"
+
+"function schedReconnect(){"
+    "clearTimeout(wsReconnectTimer);"
+    "wsReconnectTimer=setTimeout(()=>{"
+        "wsConnect();"
+        "wsReconnectDelay=Math.min(wsReconnectDelay*1.5,5000);"
+    "},wsReconnectDelay);"
+"}"
+
+"function setWsUI(state,text){"
+    "const dot=document.getElementById('wsDot');"
+    "const st=document.getElementById('wsStatus');"
+    "dot.className='status-dot '+state;"
+    "st.textContent=text;"
+"}"
+
+/* ── Procesar dato recibido (refs cacheadas para 50 Hz) ── */
+"const $gyroZ=document.getElementById('gyroZ');"
+"const $rawZ=document.getElementById('rawZ');"
+"const $ts=document.getElementById('timestamp');"
+"const $biasZ=document.getElementById('biasZ');"
+"const $angleZ=document.getElementById('angleZ');"
+"const $tempC=document.getElementById('tempC');"
+"const $masT=document.getElementById('masT');"
+"const $masF=document.getElementById('masF');"
+"const $masOn=document.getElementById('masOmegaN');"
+"const $masAmp=document.getElementById('masAmp');"
+"const $oscBadge=document.getElementById('oscBadge');"
+"const $fps=document.getElementById('fps');"
+"const $sampleCount=document.getElementById('sampleCount');"
+
+"function handleData(d){"
+    "const gz=d.gz;"
+    "const angle=d.az;"
+
+    /* ω(t) */
+    "$gyroZ.textContent=gz.toFixed(2);"
+    "$gyroZ.className='big-value '+(gz>0.5?'positive':(gz<-0.5?'negative':'zero'));"
+    "$rawZ.textContent=d.rz;"
+    "$ts.textContent=d.ts+' ms';"
+
+    /* Bias */
+    "if(d.bi!==undefined){"
+        "$biasZ.textContent=d.bi.toFixed(4)+' °/s';"
+    "}"
+
+    /* θ(t) */
+    "$angleZ.textContent=angle.toFixed(2)+'°';"
+
+    /* Temperatura */
+    "if(d.tc!==undefined){"
+        "$tempC.textContent=d.tc.toFixed(1)+' °C';"
+    "}"
+
+    /* MAS parameters */
+    "if(d.mv){"
+        "$masT.textContent=d.pe.toFixed(3)+' s';"
+        "$masF.textContent=d.fr.toFixed(3)+' Hz';"
+        "$masOn.textContent=d.on.toFixed(3)+' rad/s';"
+        "$masAmp.textContent=d.am.toFixed(2)+' °/s';"
+        "$oscBadge.className='osc-badge';"
+        "$oscBadge.textContent='✓ '+d.oc+' oscilaciones detectadas';"
+    "}else{"
+        "$oscBadge.className='osc-badge waiting';"
+        "$oscBadge.textContent='⏳ Esperando oscilaciones...';"
+    "}"
+
+    /* Gráficas — acumular puntos y pedir dibujo */
+    "omegaPts.push(gz);"
+    "thetaPts.push(angle);"
+    "if(omegaPts.length>MAX_PTS)omegaPts.shift();"
+    "if(thetaPts.length>MAX_PTS)thetaPts.shift();"
+    "schedDraw();"
+
+    /* Acumular en buffer de export si está grabando */
+    "if(isRecording){"
+        "exportBuf.push({"
+            "ts:d.ts,gz:d.gz,rz:d.rz,az:d.az,"
+            "bi:d.bi!==undefined?d.bi:0,"
+            "tc:d.tc!==undefined?d.tc:0,"
+            "mv:d.mv?1:0,pe:d.pe||0,fr:d.fr||0,"
+            "on:d.on||0,am:d.am||0,oc:d.oc||0"
+        "});"
+        "$sampleCount.textContent=exportBuf.length;"
+    "}"
+
+    /* Gauge */
+    "updateGauge(gz);"
+
+    /* FPS counter */
+    "fpsCount++;"
+    "const now=Date.now();"
+    "if(now-lastFpsTime>=1000){"
+        "$fps.textContent=fpsCount+' muestras/s';"
+        "fpsCount=0;lastFpsTime=now;"
+    "}"
+"}"
+
+/* ── Reinicio completo (REST) ── */
 "async function doReset(){"
     "const btn=document.getElementById('btnReset');"
     "btn.classList.add('disabled');"
@@ -686,7 +857,8 @@ static const char MAIN_PAGE_HTML[] =
     "try{"
         "const r=await fetch('/reset',{method:'POST'});"
         "const d=await r.json();"
-        "omegaPts=[];thetaPts=[];"
+        "omegaPts=[];thetaPts=[];exportBuf=[];"
+        "document.getElementById('sampleCount').textContent='0';"
         "document.getElementById('angleZ').innerHTML='0.00<span class=\"unit\">°</span>';"
         "document.getElementById('gyroZ').innerHTML='0.00<span class=\"unit\">°/s</span>';"
         "document.getElementById('gyroZ').className='big-value zero';"
@@ -697,13 +869,12 @@ static const char MAIN_PAGE_HTML[] =
     "btn.innerHTML='↺ Reiniciar (θ=0, ω=0, MAS)';"
 "}"
 
-/* ── Calibración manual ── */
+/* ── Calibración manual (REST) ── */
 "async function doCalibrate(){"
     "const btn=document.getElementById('btnCalib');"
     "btn.classList.add('disabled');"
     "btn.innerHTML='<span class=\"spinner\"></span> Calibrando... (~5s)';"
     "showToast('⚖ Calibrando bias — NO mover el sensor...','warning',7000);"
-    "polling=false;"  /* Pausar polling durante calibración */
     "try{"
         "const r=await fetch('/calibrate',{method:'POST'});"
         "const d=await r.json();"
@@ -717,25 +888,221 @@ static const char MAIN_PAGE_HTML[] =
             "showToast('✗ Calibración fallida: '+d.message,'error',4000);"
         "}"
     "}catch(e){showToast('✗ Error de conexión al calibrar','error')}"
-    "polling=true;"
     "btn.classList.remove('disabled');"
     "btn.innerHTML='⚖ Calibrar Bias (~5s)';"
 "}"
 
-/* ── Wrapper de fetch con pausa ── */
-"async function safeFetch(){"
-    "if(polling)await fetchData();"
+/* ── Toggle grabación ── */
+"function toggleRecording(){"
+    "isRecording=!isRecording;"
+    "const btn=document.getElementById('btnRec');"
+    "if(isRecording){"
+        "btn.className='btn-ctrl btn-rec recording';"
+        "btn.innerHTML='<span class=\"rec-dot\"></span> ● Grabando';"
+        "showToast('● Grabación reanudada','success',1500);"
+    "}else{"
+        "btn.className='btn-ctrl btn-rec';"
+        "btn.innerHTML='⏸ Pausado';"
+        "showToast('⏸ Grabación pausada — los datos existentes se conservan','info',2000);"
+    "}"
 "}"
 
-/* ── Loop principal: 5 Hz ── */
-"setInterval(safeFetch,200);"
-"fetchData();"
+/* ── Exportar datos como CSV ── */
+"function doExport(){"
+    "if(exportBuf.length===0){"
+        "showToast('⚠ No hay datos para exportar — espera a recibir muestras','warning',3000);"
+        "return;"
+    "}"
+
+    /* Cabecera CSV */
+    "const hdr='Timestamp_ms,Gyro_Z_dps,Raw_Z,Angulo_Z_deg,Bias_dps,Temp_C,MAS_Valido,Periodo_s,Frecuencia_Hz,Omega_n_rads,Amplitud_dps,Oscilaciones';"
+
+    /* Filas */
+    "let csv=hdr+'\\n';"
+    "for(const r of exportBuf){"
+        "csv+=r.ts+','+r.gz.toFixed(4)+','+r.rz+','+r.az.toFixed(4)+','"
+            "+r.bi.toFixed(4)+','+r.tc.toFixed(1)+','+r.mv+','"
+            "+r.pe.toFixed(4)+','+r.fr.toFixed(4)+','"
+            "+r.on.toFixed(4)+','+r.am.toFixed(3)+','+r.oc+'\\n';"
+    "}"
+
+    /* Crear blob y descargar */
+    "const blob=new Blob([csv],{type:'text/csv;charset=utf-8;'});"
+    "const url=URL.createObjectURL(blob);"
+    "const a=document.createElement('a');"
+    "const now=new Date();"
+    "const fname='pendulo_torsion_'"
+        "+now.getFullYear()"
+        "+String(now.getMonth()+1).padStart(2,'0')"
+        "+String(now.getDate()).padStart(2,'0')"
+        "+'_'"
+        "+String(now.getHours()).padStart(2,'0')"
+        "+String(now.getMinutes()).padStart(2,'0')"
+        "+String(now.getSeconds()).padStart(2,'0')"
+        "+'.csv';"
+    "a.href=url;a.download=fname;"
+    "document.body.appendChild(a);a.click();"
+    "document.body.removeChild(a);"
+    "URL.revokeObjectURL(url);"
+    "showToast('✓ CSV exportado: '+exportBuf.length+' muestras → '+fname,'success',4000);"
+"}"
+
+/* ── Iniciar WebSocket ── */
+"wsConnect();"
 
 "</script>"
 "</body></html>";
 
 /* ══════════════════════════════════════════════════════════════
- *  HTTP Handlers
+ *  WebSocket — Gestión del lado servidor (ESP32)
+ * ══════════════════════════════════════════════════════════════ */
+
+/**
+ * @brief Elimina un file descriptor de la lista de clientes WS
+ */
+static void ws_remove_client(int fd)
+{
+    for (int i = 0; i < s_ws_count; i++) {
+        if (s_ws_fds[i] == fd) {
+            s_ws_fds[i] = s_ws_fds[s_ws_count - 1];
+            s_ws_count--;
+            ESP_LOGI(TAG, "WS cliente desconectado (fd=%d). Activos: %d", fd, s_ws_count);
+            return;
+        }
+    }
+}
+
+/**
+ * @brief Handler para el endpoint WebSocket /ws
+ *
+ * Cuando un cliente se conecta, su file descriptor se guarda para
+ * que la tarea ws_push_task le envíe datos.
+ */
+static esp_err_t ws_handler(httpd_req_t *req)
+{
+    /* Si es un handshake (HTTP GET → Upgrade), aceptar */
+    if (req->method == HTTP_GET) {
+        int fd = httpd_req_to_sockfd(req);
+        ESP_LOGI(TAG, "WS handshake aceptado (fd=%d)", fd);
+
+        /* Agregar a la lista de clientes */
+        if (s_ws_count < WS_MAX_CLIENTS) {
+            s_ws_fds[s_ws_count++] = fd;
+            ESP_LOGI(TAG, "WS clientes activos: %d", s_ws_count);
+        } else {
+            ESP_LOGW(TAG, "Máximo de clientes WS alcanzado (%d), rechazando", WS_MAX_CLIENTS);
+        }
+        return ESP_OK;
+    }
+
+    /* Frame de datos: leer (puede ser ping/pong/close del cliente) */
+    httpd_ws_frame_t ws_pkt;
+    memset(&ws_pkt, 0, sizeof(ws_pkt));
+    ws_pkt.type = HTTPD_WS_TYPE_TEXT;
+
+    esp_err_t ret = httpd_ws_recv_frame(req, &ws_pkt, 0);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "WS recv frame error: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    /* Si el cliente envió un close o se perdió el frame, remover */
+    if (ws_pkt.type == HTTPD_WS_TYPE_CLOSE) {
+        int fd = httpd_req_to_sockfd(req);
+        ws_remove_client(fd);
+    }
+
+    return ESP_OK;
+}
+
+/**
+ * @brief Tarea FreeRTOS que lee el MPU6050 y empuja datos a clientes WS
+ *
+ * Esta tarea corre a WS_PUSH_RATE_MS (20ms = 50 Hz) y envía un JSON
+ * compacto con todos los datos del sensor a cada cliente WebSocket conectado.
+ *
+ * Las claves JSON son cortas para minimizar el tamaño del payload:
+ *   gz = gyro_z_dps, rz = raw_z, az = angle_z, ts = timestamp,
+ *   bi = bias, tc = temp_c, mv = mas_valid, pe = period, fr = freq,
+ *   on = omega_n, am = amplitude, oc = oscillations
+ */
+static void ws_push_task(void *arg)
+{
+    httpd_handle_t server = (httpd_handle_t)arg;
+
+    ESP_LOGI(TAG, "WS push task iniciada (intervalo=%d ms, target=%d Hz)",
+             WS_PUSH_RATE_MS, 1000 / WS_PUSH_RATE_MS);
+
+    char json_buf[320];
+    TickType_t last_wake = xTaskGetTickCount();
+    uint32_t temp_counter = 0;
+    float cached_temp = 0.0f;
+
+    while (1) {
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(WS_PUSH_RATE_MS));
+
+        /* Si no hay clientes, no hacer nada */
+        if (s_ws_count == 0) {
+            continue;
+        }
+
+        /* Leer sensor */
+        mpu6050_data_t sd = {0};
+        esp_err_t ret = mpu6050_read_gyro_z(&sd);
+        if (ret != ESP_OK) {
+            continue;
+        }
+
+        /* Leer temperatura solo cada ~1 segundo (50 ciclos) para no sobrecargar I2C */
+        temp_counter++;
+        if (temp_counter >= 50) {
+            mpu6050_read_temperature(&cached_temp);
+            temp_counter = 0;
+        }
+
+        /* Construir JSON compacto */
+        int len = snprintf(json_buf, sizeof(json_buf),
+            "{\"gz\":%.3f,\"rz\":%d,\"az\":%.3f,"
+            "\"ts\":%lld,\"tc\":%.1f,\"bi\":%.4f,"
+            "\"mv\":%s,\"pe\":%.4f,\"fr\":%.4f,"
+            "\"on\":%.4f,\"am\":%.3f,\"oc\":%lu}",
+            sd.gyro_z_dps,
+            (int)sd.gyro_z_raw,
+            sd.angle_z_deg,
+            (long long)sd.timestamp_ms,
+            cached_temp,
+            sd.bias_z_dps,
+            sd.mas_valid ? "true" : "false",
+            sd.period_s,
+            sd.frequency_hz,
+            sd.omega_n,
+            sd.amplitude_dps,
+            (unsigned long)sd.oscillations
+        );
+
+        /* Enviar a cada cliente WS conectado */
+        httpd_ws_frame_t ws_pkt;
+        memset(&ws_pkt, 0, sizeof(ws_pkt));
+        ws_pkt.payload = (uint8_t *)json_buf;
+        ws_pkt.len = len;
+        ws_pkt.type = HTTPD_WS_TYPE_TEXT;
+
+        for (int i = 0; i < s_ws_count; ) {
+            esp_err_t send_ret = httpd_ws_send_frame_async(server, s_ws_fds[i], &ws_pkt);
+            if (send_ret != ESP_OK) {
+                ESP_LOGW(TAG, "WS envío fallido a fd=%d (%s), removiendo",
+                         s_ws_fds[i], esp_err_to_name(send_ret));
+                ws_remove_client(s_ws_fds[i]);
+                /* No incrementar i, el array se compactó */
+            } else {
+                i++;
+            }
+        }
+    }
+}
+
+/* ══════════════════════════════════════════════════════════════
+ *  HTTP Handlers (REST para acciones, no para datos)
  * ══════════════════════════════════════════════════════════════ */
 
 /**
@@ -767,49 +1134,6 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 
     /* Finalizar chunked response */
     return httpd_resp_send_chunk(req, NULL, 0);
-}
-
-/**
- * @brief Handler GET /data — Retorna JSON con datos del giroscopio y MAS
- */
-static esp_err_t data_get_handler(httpd_req_t *req)
-{
-    mpu6050_data_t sd = {0};
-    esp_err_t ret = mpu6050_read_gyro_z(&sd);
-
-    float temp_c = 0.0f;
-    mpu6050_read_temperature(&temp_c);
-
-    char json_buf[512];
-
-    if (ret == ESP_OK) {
-        snprintf(json_buf, sizeof(json_buf),
-            "{\"gyro_z\":%.3f,\"raw_z\":%d,\"angle_z\":%.3f,"
-            "\"timestamp\":%lld,\"temp_c\":%.1f,\"bias\":%.4f,"
-            "\"mas_valid\":%s,\"period\":%.4f,\"freq\":%.4f,"
-            "\"omega_n\":%.4f,\"amplitude\":%.3f,\"oscillations\":%lu}",
-            sd.gyro_z_dps,
-            (int)sd.gyro_z_raw,
-            sd.angle_z_deg,
-            (long long)sd.timestamp_ms,
-            temp_c,
-            sd.bias_z_dps,
-            sd.mas_valid ? "true" : "false",
-            sd.period_s,
-            sd.frequency_hz,
-            sd.omega_n,
-            sd.amplitude_dps,
-            (unsigned long)sd.oscillations
-        );
-    } else {
-        snprintf(json_buf, sizeof(json_buf),
-            "{\"error\":\"sensor_read_failed\",\"code\":%d}", (int)ret);
-    }
-
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
-    return httpd_resp_send(req, json_buf, strlen(json_buf));
 }
 
 /**
@@ -862,11 +1186,12 @@ static const httpd_uri_t uri_root = {
     .user_ctx  = NULL,
 };
 
-static const httpd_uri_t uri_data = {
-    .uri       = "/data",
-    .method    = HTTP_GET,
-    .handler   = data_get_handler,
-    .user_ctx  = NULL,
+static const httpd_uri_t uri_ws = {
+    .uri          = "/ws",
+    .method       = HTTP_GET,
+    .handler      = ws_handler,
+    .user_ctx     = NULL,
+    .is_websocket = true,
 };
 
 static const httpd_uri_t uri_reset = {
@@ -896,12 +1221,12 @@ esp_err_t web_server_start(void)
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_uri_handlers = 8;
-    config.max_open_sockets = 5;    /* LWIP_MAX_SOCKETS=8 en sdkconfig, HTTP usa 3 internos → max 5 */
+    config.max_open_sockets = 5;    /* 5 user + 3 internal = 8 ≤ LWIP_MAX_SOCKETS(10) */
     config.stack_size = 8192;
     config.lru_purge_enable = true;
 
     ESP_LOGI(TAG, "═══════════════════════════════════════════");
-    ESP_LOGI(TAG, "  Iniciando servidor HTTP en puerto %d", config.server_port);
+    ESP_LOGI(TAG, "  Iniciando servidor HTTP+WS en puerto %d", config.server_port);
 
     esp_err_t ret = httpd_start(&s_server, &config);
     if (ret != ESP_OK) {
@@ -911,14 +1236,34 @@ esp_err_t web_server_start(void)
 
     /* Registrar handlers */
     httpd_register_uri_handler(s_server, &uri_root);
-    httpd_register_uri_handler(s_server, &uri_data);
+    httpd_register_uri_handler(s_server, &uri_ws);
     httpd_register_uri_handler(s_server, &uri_reset);
     httpd_register_uri_handler(s_server, &uri_calibrate);
 
-    ESP_LOGI(TAG, "  Servidor HTTP iniciado ✓");
+    /* Inicializar lista de clientes WS */
+    s_ws_count = 0;
+    memset(s_ws_fds, -1, sizeof(s_ws_fds));
+
+    /* Crear tarea de push WebSocket */
+    BaseType_t task_ret = xTaskCreatePinnedToCore(
+        ws_push_task,
+        "ws_push",
+        4096,               /* Stack: 4 KB es suficiente */
+        (void *)s_server,   /* Pasar handle del servidor */
+        5,                  /* Prioridad alta para baja latencia */
+        &s_ws_task_handle,
+        1                   /* Core 1 (Core 0 para WiFi) */
+    );
+
+    if (task_ret != pdPASS) {
+        ESP_LOGE(TAG, "Error al crear tarea ws_push");
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "  Servidor HTTP+WebSocket iniciado ✓");
     ESP_LOGI(TAG, "  Endpoints:");
     ESP_LOGI(TAG, "    GET  /          → Interfaz web");
-    ESP_LOGI(TAG, "    GET  /data      → JSON giroscopio + MAS");
+    ESP_LOGI(TAG, "    WS   /ws        → WebSocket datos tiempo real (50 Hz)");
     ESP_LOGI(TAG, "    POST /reset     → Reiniciar ángulo + MAS");
     ESP_LOGI(TAG, "    POST /calibrate → Recalibrar bias del gyro");
     ESP_LOGI(TAG, "═══════════════════════════════════════════");
@@ -932,8 +1277,16 @@ esp_err_t web_server_stop(void)
         return ESP_OK;
     }
 
+    /* Detener tarea de push */
+    if (s_ws_task_handle != NULL) {
+        vTaskDelete(s_ws_task_handle);
+        s_ws_task_handle = NULL;
+    }
+
+    s_ws_count = 0;
+
     esp_err_t ret = httpd_stop(s_server);
     s_server = NULL;
-    ESP_LOGI(TAG, "Servidor HTTP detenido");
+    ESP_LOGI(TAG, "Servidor HTTP+WS detenido");
     return ret;
 }
