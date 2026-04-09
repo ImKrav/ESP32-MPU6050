@@ -261,19 +261,19 @@ esp_err_t mpu6050_init(void)
     }
     ESP_LOGI(TAG, "✓ DLPF configurado: BW=42 Hz");
 
-    /* ── 7. Configurar escala del giroscopio: ±250 °/s ── */
-    /* Para péndulo de torsión:
-     * - Movimiento lento → ±250 °/s da máxima resolución (131 LSB/°/s)
-     * - Es decir, resolución de ~0.0076 °/s por bit
-     * - Suficiente para detectar oscilaciones lentas del péndulo
+    /* ── 7. Configurar escala del giroscopio: ±2000 °/s ── */
+    /* Rango máximo para capturar movimientos bruscos sin saturación.
+     * - ±2000 °/s → 16.4 LSB/°/s → resolución de ~0.061 °/s por bit
+     * - Suficiente para detectar oscilaciones del péndulo
+     * - Evita clipping en movimientos rápidos
      */
-    ret = mpu6050_write_reg(MPU6050_REG_GYRO_CONFIG, MPU6050_GYRO_FS_250);
+    ret = mpu6050_write_reg(MPU6050_REG_GYRO_CONFIG, MPU6050_GYRO_FS_2000);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Error al configurar giroscopio: %s", esp_err_to_name(ret));
         return ret;
     }
-    s_gyro_lsb_sensitivity = MPU6050_GYRO_FS_250_LSB;
-    ESP_LOGI(TAG, "✓ Giroscopio configurado: ±250 °/s (sensibilidad: %.1f LSB/°/s)",
+    s_gyro_lsb_sensitivity = MPU6050_GYRO_FS_2000_LSB;
+    ESP_LOGI(TAG, "✓ Giroscopio configurado: ±2000 °/s (sensibilidad: %.1f LSB/°/s)",
              s_gyro_lsb_sensitivity);
 
     /* ── 8. Calibrar bias del giroscopio ── */

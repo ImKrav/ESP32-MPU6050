@@ -505,7 +505,7 @@ static const char MAIN_PAGE_HTML[] =
                 "<text x='100' y='112' text-anchor='middle' fill='#6666aa' "
                     "font-size='10' font-family='Segoe UI,system-ui,sans-serif'>°/s</text>"
             "</svg>"
-            "<div class='gauge-label'>Rango: ±250 °/s</div>"
+            "<div class='gauge-label'>Rango: ±2000 °/s</div>"
         "</div>"
     "</div>"
 
@@ -530,7 +530,7 @@ static const char MAIN_PAGE_HTML[] =
         "</div>"
         "<div class='data-row'>"
             "<span class='data-label'>Giroscopio</span>"
-            "<span class='data-value'>±250 °/s (131 LSB)</span>"
+            "<span class='data-value'>±2000 °/s (16.4 LSB)</span>"
         "</div>"
         "<div class='data-row'>"
             "<span class='data-label'>DLPF</span>"
@@ -682,7 +682,7 @@ static const char MAIN_PAGE_HTML[] =
 
 /* ── Actualizar gauge (refs cacheadas) ── */
 "function updateGauge(v){"
-    "const mx=250;"
+    "const mx=2000;"
     "const c=Math.max(-mx,Math.min(mx,v));"
     "const pct=(c+mx)/(2*mx);"
     "$gaugeArc.setAttribute('stroke-dasharray',(pct*251)+' 251');"
