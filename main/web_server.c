@@ -347,6 +347,18 @@ static const char MAIN_PAGE_HTML[] =
     "background:rgba(74,222,128,0.06);color:#4ade80;"
 "}"
 ".rec-counter .counter-num{font-weight:700;font-variant-numeric:tabular-nums}"
+".chrono-badge{"
+    "display:inline-flex;align-items:center;gap:5px;"
+    "padding:3px 10px;border-radius:12px;font-size:0.72em;"
+    "border:1px solid rgba(248,113,113,0.25);"
+    "background:rgba(248,113,113,0.08);color:#f87171;"
+    "font-variant-numeric:tabular-nums;font-weight:700;"
+    "letter-spacing:0.5px;"
+"}"
+".chrono-badge.running{"
+    "border-color:rgba(248,113,113,0.4);"
+    "background:rgba(248,113,113,0.12);color:#fca5a5;"
+"}"
 
 /* Status toast */
 ".toast{"
@@ -407,6 +419,7 @@ static const char MAIN_PAGE_HTML[] =
         "📥 Exportar CSV"
     "</button>"
     "<span class='rec-counter' id='recCounter'>📊 <span class='counter-num' id='sampleCount'>0</span> muestras</span>"
+    "<span class='chrono-badge' id='chronoBadge'>⏱ <span id='chronoDisplay'>0.0 s</span></span>"
 "</div>"
 
 /* ── Toast notification ── */
@@ -560,8 +573,35 @@ static const char MAIN_PAGE_HTML[] =
 "let lastFpsTime=Date.now();"
 
 /* ── Data Export Buffer ── */
-"let exportBuf=[];"   /* Array de objetos: {ts, gz, rz, az, bi, tc, pe, fr, on, am, oc, mv} */
+"let exportBuf=[];"   /* Array de objetos: {t, gz, rz, az, bi, pe, fr, on, am, oc, mv} */
 "let isRecording=true;"  /* Empieza grabando por defecto */
+"let oscBaseline=0;"     /* Oscilaciones al iniciar grabación (para contar relativas) */
+"let lastOsc=0;"         /* Último valor de oscilaciones recibido del sensor */
+
+/* ── Cronómetro de grabación ── */
+"let chronoStart=Date.now();"  /* Timestamp JS de inicio del cronómetro */
+"let chronoElapsed=0;"         /* Tiempo acumulado en ms (para pausas) */
+"let chronoInterval=null;"     /* Intervalo de actualización del display */
+
+"function formatChrono(ms){"
+    "return (ms/1000).toFixed(1)+' s';"
+"}"
+
+"function updateChronoDisplay(){"
+    "const now=Date.now();"
+    "const total=chronoElapsed+(now-chronoStart);"
+    "document.getElementById('chronoDisplay').textContent=formatChrono(total);"
+"}"
+
+"function getChronoSeconds(){"
+    "const now=Date.now();"
+    "return (chronoElapsed+(now-chronoStart))/1000;"
+"}"
+
+/* Iniciar cronómetro (empieza grabando) */
+"chronoStart=Date.now();"
+"chronoInterval=setInterval(updateChronoDisplay,100);"
+"document.getElementById('chronoBadge').classList.add('running');"
 
 /* ── Canvas setup (optimizado para rendimiento) ── */
 "const canvas=document.getElementById('chart');"
@@ -826,13 +866,14 @@ static const char MAIN_PAGE_HTML[] =
     "schedDraw();"
 
     /* Acumular en buffer de export si está grabando */
+    "lastOsc=d.oc||0;"
     "if(isRecording){"
+        "const relOsc=lastOsc-oscBaseline;"
         "exportBuf.push({"
-            "ts:d.ts,gz:d.gz,rz:d.rz,az:d.az,"
+            "t:getChronoSeconds(),gz:d.gz,rz:d.rz,az:d.az,"
             "bi:d.bi!==undefined?d.bi:0,"
-            "tc:d.tc!==undefined?d.tc:0,"
-            "mv:d.mv?1:0,pe:d.pe||0,fr:d.fr||0,"
-            "on:d.on||0,am:d.am||0,oc:d.oc||0"
+            "mv:(relOsc>0&&d.mv)?1:0,pe:d.pe||0,fr:d.fr||0,"
+            "on:d.on||0,am:d.am||0,oc:relOsc"
         "});"
         "$sampleCount.textContent=exportBuf.length;"
     "}"
@@ -858,6 +899,9 @@ static const char MAIN_PAGE_HTML[] =
         "const r=await fetch('/reset',{method:'POST'});"
         "const d=await r.json();"
         "omegaPts=[];thetaPts=[];exportBuf=[];"
+        /* Reiniciar cronómetro */
+        "chronoElapsed=0;chronoStart=Date.now();"
+        "document.getElementById('chronoDisplay').textContent='0.0 s';"
         "document.getElementById('sampleCount').textContent='0';"
         "document.getElementById('angleZ').innerHTML='0.00<span class=\"unit\">°</span>';"
         "document.getElementById('gyroZ').innerHTML='0.00<span class=\"unit\">°/s</span>';"
@@ -896,11 +940,24 @@ static const char MAIN_PAGE_HTML[] =
 "function toggleRecording(){"
     "isRecording=!isRecording;"
     "const btn=document.getElementById('btnRec');"
+    "const badge=document.getElementById('chronoBadge');"
     "if(isRecording){"
+        /* Capturar oscilaciones actuales como base */
+        "oscBaseline=lastOsc;"
+        /* Reiniciar cronómetro y buffer desde cero */
+        "chronoElapsed=0;chronoStart=Date.now();exportBuf=[];"
+        "$sampleCount.textContent='0';"
+        "document.getElementById('chronoDisplay').textContent='0.0 s';"
+        "chronoInterval=setInterval(updateChronoDisplay,100);"
+        "badge.classList.add('running');"
         "btn.className='btn-ctrl btn-rec recording';"
         "btn.innerHTML='<span class=\"rec-dot\"></span> ● Grabando';"
-        "showToast('● Grabación reanudada','success',1500);"
+        "showToast('● Grabación iniciada','success',1500);"
     "}else{"
+        /* Pausar cronómetro: acumular tiempo transcurrido */
+        "chronoElapsed+=(Date.now()-chronoStart);"
+        "clearInterval(chronoInterval);"
+        "badge.classList.remove('running');"
         "btn.className='btn-ctrl btn-rec';"
         "btn.innerHTML='⏸ Pausado';"
         "showToast('⏸ Grabación pausada — los datos existentes se conservan','info',2000);"
@@ -915,13 +972,13 @@ static const char MAIN_PAGE_HTML[] =
     "}"
 
     /* Cabecera CSV */
-    "const hdr='Timestamp_ms,Gyro_Z_dps,Raw_Z,Angulo_Z_deg,Bias_dps,Temp_C,MAS_Valido,Periodo_s,Frecuencia_Hz,Omega_n_rads,Amplitud_dps,Oscilaciones';"
+    "const hdr='Tiempo_s,Gyro_Z_dps,Raw_Z,Angulo_Z_deg,Bias_dps,MAS_Valido,Periodo_s,Frecuencia_Hz,Omega_n_rads,Amplitud_dps,Oscilaciones';"
 
     /* Filas */
     "let csv=hdr+'\\n';"
     "for(const r of exportBuf){"
-        "csv+=r.ts+','+r.gz.toFixed(4)+','+r.rz+','+r.az.toFixed(4)+','"
-            "+r.bi.toFixed(4)+','+r.tc.toFixed(1)+','+r.mv+','"
+        "csv+=r.t.toFixed(4)+','+r.gz.toFixed(4)+','+r.rz+','+r.az.toFixed(4)+','"
+            "+r.bi.toFixed(4)+','+r.mv+','"
             "+r.pe.toFixed(4)+','+r.fr.toFixed(4)+','"
             "+r.on.toFixed(4)+','+r.am.toFixed(3)+','+r.oc+'\\n';"
     "}"
